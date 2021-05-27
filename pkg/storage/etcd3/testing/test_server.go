@@ -17,6 +17,7 @@ limitations under the License.
 package testing
 
 import (
+	"crypto/tls"
 	"fmt"
 	"io/ioutil"
 	"net"
@@ -33,26 +34,26 @@ import (
 
 	"context"
 
-	etcd "go.etcd.io/etcd/client"
-	"go.etcd.io/etcd/clientv3"
-	"go.etcd.io/etcd/etcdserver"
-	"go.etcd.io/etcd/etcdserver/api/etcdhttp"
-	"go.etcd.io/etcd/etcdserver/api/v2http"
-	"go.etcd.io/etcd/integration"
-	"go.etcd.io/etcd/pkg/testutil"
-	"go.etcd.io/etcd/pkg/transport"
-	"go.etcd.io/etcd/pkg/types"
+	"go.etcd.io/etcd/client/pkg/v3/testutil"
+	"go.etcd.io/etcd/client/pkg/v3/transport"
+	"go.etcd.io/etcd/client/pkg/v3/types"
+	clientv3 "go.etcd.io/etcd/client/v3"
+
+	"go.etcd.io/etcd/server/v3/config"
+	"go.etcd.io/etcd/server/v3/etcdserver"
+	"go.etcd.io/etcd/server/v3/etcdserver/api/etcdhttp"
+	"go.etcd.io/etcd/server/v3/etcdserver/api/v2http"
+	"go.etcd.io/etcd/tests/v3/integration"
 	"go.uber.org/zap"
-	"k8s.io/klog/v2"
 )
 
 // EtcdTestServer encapsulates the datastructures needed to start local instance for testing
 type EtcdTestServer struct {
 	// The following are lumped etcd2 test server params
 	// TODO: Deprecate in a post 1.5 release
-	etcdserver.ServerConfig
+	config.ServerConfig
 	PeerListeners, ClientListeners []net.Listener
-	Client                         etcd.Client
+	Client                         *clientv3.Client
 
 	CertificatesDir string
 	CertFile        string
@@ -102,7 +103,7 @@ func newSecuredLocalListener(t *testing.T, certFile, keyFile, caFile string) net
 }
 
 // newHTTPTransport create a new tls-based transport.
-func newHTTPTransport(t *testing.T, certFile, keyFile, caFile string) etcd.CancelableTransport {
+func newHTTPTransport(t *testing.T, certFile, keyFile, caFile string) *http.Transport {
 	tlsInfo := transport.TLSInfo{
 		CertFile:      certFile,
 		KeyFile:       keyFile,
@@ -217,17 +218,26 @@ func (m *EtcdTestServer) launch(t *testing.T) error {
 
 // waitForEtcd wait until etcd is propagated correctly
 func (m *EtcdTestServer) waitUntilUp() error {
-	membersAPI := etcd.NewMembersAPI(m.Client)
 	for start := time.Now(); time.Since(start) < wait.ForeverTestTimeout; time.Sleep(10 * time.Millisecond) {
-		members, err := membersAPI.List(context.TODO())
+		mresp, err := m.Client.MemberList(context.TODO())
 		if err != nil {
-			klog.Errorf("Error when getting etcd cluster members")
-			continue
+			return err
 		}
-		if len(members) == 1 && len(members[0].ClientURLs) > 0 {
+		if len(mresp.Members) == 1 && len(mresp.Members[0].ClientURLs) > 0 {
 			return nil
 		}
 	}
+	// membersAPI := clientv3.NewMembersAPI(m.Client)
+	// for start := time.Now(); time.Since(start) < wait.ForeverTestTimeout; time.Sleep(10 * time.Millisecond) {
+	// 	members, err := membersAPI.List(context.TODO())
+	// 	if err != nil {
+	// 		klog.Errorf("Error when getting etcd cluster members")
+	// 		continue
+	// 	}
+	// 	if len(members) == 1 && len(members[0].ClientURLs) > 0 {
+	// 		return nil
+	// 	}
+	// }
 	return fmt.Errorf("timeout on waiting for etcd cluster")
 }
 
@@ -236,7 +246,7 @@ func (m *EtcdTestServer) Terminate(t *testing.T) {
 	if m.v3Cluster != nil {
 		m.v3Cluster.Terminate(t)
 	} else {
-		m.Client = nil
+		m.Client.Close()
 		m.s.Stop()
 		// TODO: This is a pretty ugly hack to workaround races during closing
 		// in-memory etcd server in unit tests - see #18928 for more details.
@@ -268,12 +278,21 @@ func NewEtcdTestClientServer(t *testing.T) *EtcdTestServer {
 		t.Fatalf("Failed to start etcd server error=%v", err)
 		return nil
 	}
-
-	cfg := etcd.Config{
-		Endpoints: server.ClientURLs.StringSlice(),
-		Transport: newHTTPTransport(t, server.CertFile, server.KeyFile, server.CAFile),
+	cert, err := tls.LoadX509KeyPair(server.CertFile, server.KeyFile)
+	if err != nil {
+		t.Fatalf("Error loading X509 key pair=%v", err)
+		return nil
 	}
-	server.Client, err = etcd.New(cfg)
+	cfg := clientv3.Config{
+		Endpoints: server.ClientURLs.StringSlice(),
+		TLS: &tls.Config{
+			Certificates: []tls.Certificate{
+				cert,
+			},
+		},
+		//Transport: newHTTPTransport(t, server.CertFile, server.KeyFile, server.CAFile),
+	}
+	server.Client, err = clientv3.New(cfg)
 	if err != nil {
 		server.Terminate(t)
 		t.Fatalf("Unexpected error in NewEtcdTestClientServer (%v)", err)
